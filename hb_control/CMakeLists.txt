@@ -40,6 +40,7 @@ install(
   PROGRAMS src/mqtt.py
   PROGRAMS src/mqtt_1.py
   PROGRAMS src/task_1c.py
+  PROGRAMS src/perception.py
   PROGRAMS src/holonomic_controller_hardware.py
   DESTINATION lib/${PROJECT_NAME}
 )
