@@ -3,28 +3,27 @@
 import rclpy
 from rclpy.node import Node
 from hb_interfaces.msg import Pose2D,Poses2D,BotCmdArray,BotCmd
-from linkattacher_msgs.srv import AttachLink, DetachLink
+from linkattacher_msgs.srv import AttachLink,DetachLink
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 import math
 import time
-from std_msgs.msg import Bool
-from hb_interfaces.msg import BotIrState
 import json
+import heapq
+from std_msgs.msg import Bool
+
 
 # STATES
-
 # IDLE
 # GO_TO_CRATE
 # PICK_UP
 # GO_TO_DROP_ZONE
 # DROP
-# check if any crate is left(not a state)  if yes then repeat
 # GO_TO_DOCKING_ZONE
 
 # BOTS              PRIORITY
 # 0 - Crystal          3
-# 2 - Frostbite        2    
+# 2 - Frostbite        2
 # 4 - Glacio           1
 
 # DROP_ZONE
@@ -54,29 +53,28 @@ class PID:
         self.integral = 0.0
         self.prev_error = 0.0
 
-class MultiHolonomicController(Node):
+class HolonomicPIDController(Node):
     def __init__(self):
-        super().__init__('multiholonomic_controller_hardware') 
+        super().__init__('holonomic_pid_controller_2') 
         
         self.bot_id = [0,1,2]
         self.dt = None
         self.last_time = self.get_clock().now()
         self.error_tol = 5.0   
-        self.max_vel = 90.0   
-                
+        self.max_vel = 100.0   
+        
         self.pid_params = {
-            'x': {'kp': 3.5, 'ki': 0.0, 'kd': 0.15, 'max_out': self.max_vel},
-            'y': {'kp': 3.5, 'ki': 0.0, 'kd': 0.15, 'max_out': self.max_vel},
-            'theta': {'kp': 1.8, 'ki': 0.0, 'kd': 0.1, 'max_out': 35.0} 
+            'x': {'kp': 6.25, 'ki': 0.005, 'kd': 0.3, 'max_out': self.max_vel},
+            'y': {'kp': 6.25, 'ki': 0.005, 'kd': 0.3, 'max_out': self.max_vel},
+            'theta': {'kp': 3.5, 'ki': 0.025, 'kd': 0.0, 'max_out': 75.0}
         }
-        
-        
+
         self.pid_controllers = {
             0: {'x': PID(**self.pid_params['x']), 'y': PID(**self.pid_params['y']), 'theta': PID(**self.pid_params['theta'])},
             1: {'x': PID(**self.pid_params['x']), 'y': PID(**self.pid_params['y']), 'theta': PID(**self.pid_params['theta'])},
             2: {'x': PID(**self.pid_params['x']), 'y': PID(**self.pid_params['y']), 'theta': PID(**self.pid_params['theta'])}
         }
-                
+        
         self.d_zone = [
             [1020, 1410, 1075, 1355] ,  #red
             [675, 965, 1920, 2115] ,  #green
@@ -92,17 +90,19 @@ class MultiHolonomicController(Node):
             [864.0,204.0,0.0]
         ]
         
-        # Waypoints for navigating to docking zone
-        self.docking_waypoints = [
-            [690, 690], [1040, 690], [1395, 690],
-            [1750, 690], [1750, 1045], [1750, 1400],
-            [1750, 1750], [1395, 1750], [1040, 1750],
-            [690, 1750], [690, 1400], [690, 1045]
-        ]
+        # ============ GRID & PATHFINDING SETUP ============
+        self.arena_size = 2438.4
+        self.grid_size = 10
+        self.cell_size = self.arena_size / self.grid_size  # 243.84mm per cell
+        self.grid = np.zeros((self.grid_size, self.grid_size), dtype=int)  # 0=free, 1=obstacle
         
-        # Track current waypoint for each bot
-        self.current_waypoint_index = [None, None, None]
-        self.waypoint_path = [[], [], []]
+        # Waypoint tracking for each bot
+        self.bot_waypoints = [[], [], []]  # List of (x,y) waypoints for each bot
+        self.bot_current_waypoint_index = [0, 0, 0]  # Current waypoint index
+        self.waypoint_reached_threshold = 60.0  # mm
+        
+        # Mark drop zones as static obstacles (for now)
+        self.mark_drop_zones_as_obstacles()
         
         self.STATE = ["IDLE","IDLE","IDLE"]
         self.bot_pose = [[None]*3, [None]*3, [None]*3]
@@ -113,8 +113,8 @@ class MultiHolonomicController(Node):
             2: "hb_glacio"
         }
         self.bot_priority = {0: 3, 1: 2, 2: 1}
-        self.arm = [100.0,100.0,100.0]
-        self.solenoid = [0.0,0.0,0.0]
+        self.base = [0.0,0.0,0.0]
+        self.elbow = [0.0,0.0,0.0]
         
         self.current_crates = set()
         self.completed_crates = set()
@@ -131,15 +131,13 @@ class MultiHolonomicController(Node):
         self.pick_start_time = [None, None, None]
         self.drop_start_time = [None, None, None]
         self.drop_wait_count = [0, 0, 0]
-        self.wait_duration = 2.5
+        self.wait_duration = 4.5 
         
-        self.ir_state = [False,False,False]
-        # self.angle_correction = [3.9,-4.3,3.15]  # Adjusted based on testing
-        # self.dist_threshold = [232.0,260.0,265.0]
+        self.bot_sub = self.create_subscription(Poses2D,"/bot_pose",self.pose_cb,10)
+        self.crate_sub = self.create_subscription(Poses2D,"/crate_pose",self.crate_cb,10)
+
+        self.vel_pub = self.create_publisher(BotCmdArray, '/bot_cmd', 10)
         
-        alpha_deg = np.array([30, 150, 270])
-        alpha_rad = np.radians(alpha_deg)
-    
         self.attach_client = self.create_client(AttachLink,"/attach_link")
         while not self.attach_client.wait_for_service(timeout_sec=1.0):
             print("attach service not available")
@@ -150,97 +148,172 @@ class MultiHolonomicController(Node):
         
         self.attach_req = AttachLink.Request()
         self.detach_req = DetachLink.Request()
+        
+        self.timer = self.create_timer(0.33, self.control_cb)
+        
+        print("Controller initialized with A* pathfinding!")
+        print(f"Grid: {self.grid_size}x{self.grid_size}, Cell size: {self.cell_size:.2f}mm")
+        
+    # ============ GRID & PATHFINDING METHODS ============
     
-        M = np.array([[np.cos(alpha_rad[0] + np.pi/2), np.cos(alpha_rad[1] + np.pi/2), np.cos(alpha_rad[2] + np.pi/2)],
-                      [np.sin(alpha_rad[0] + np.pi/2), np.sin(alpha_rad[1] + np.pi/2), np.sin(alpha_rad[2] + np.pi/2)],
-                      [1, 1, 1]])
-        self.M_inv = np.linalg.inv(M)
-        
-        self.bot_sub = self.create_subscription(Poses2D,"/bot_pose",self.pose_cb,10)
-        self.crate_sub = self.create_subscription(Poses2D,"/crate_pose",self.crate_cb,10)
-        self.ir_sub = self.create_subscription(BotIrState,"/ir_sensor_state",self.ir_callback,10)
-        self.vel_pub = self.create_publisher(BotCmdArray, '/bot_cmd', 10)
-                        
-        self.timer = self.create_timer(0.33, self.control_cb)  
-        
-        print("MultiHolonomicController Initialized")
-        
-    #------------------------------------------------------------------------------------------------------
+    def world_to_grid(self, x, y):
+        """Convert world coordinates (mm) to grid indices"""
+        grid_x = int(x / self.cell_size)
+        grid_y = int(y / self.cell_size)
+        grid_x = max(0, min(self.grid_size - 1, grid_x))
+        grid_y = max(0, min(self.grid_size - 1, grid_y))
+        return grid_x, grid_y
     
-    def is_point_in_drop_zone(self, x, y, margin=100):
-        """Check if a point is inside any drop zone with margin"""
+    def grid_to_world(self, grid_x, grid_y):
+        """Convert grid indices to world coordinates (center of cell)"""
+        x = (grid_x + 0.5) * self.cell_size
+        y = (grid_y + 0.5) * self.cell_size
+        return x, y
+    
+    def mark_drop_zones_as_obstacles(self):
+        """Mark all drop zones as obstacles in the grid"""
         for zone in self.d_zone:
-            if (zone[0] - margin < x < zone[1] + margin) and \
-               (zone[2] - margin < y < zone[3] + margin):
-                return True
-        return False
+            x_min, x_max, y_min, y_max = zone
+            gx_min, gy_min = self.world_to_grid(x_min, y_min)
+            gx_max, gy_max = self.world_to_grid(x_max, y_max)
+            
+            for gx in range(gx_min, gx_max + 1):
+                for gy in range(gy_min, gy_max + 1):
+                    if 0 <= gx < self.grid_size and 0 <= gy < self.grid_size:
+                        self.grid[gx][gy] = 1
+        
+        print("Drop zones marked as obstacles in grid")
     
-    def distance(self, x1, y1, x2, y2):
-        """Calculate Euclidean distance between two points"""
-        return math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    def heuristic(self, cell, goal):
+        """Diagonal distance heuristic for A*"""
+        dx = abs(cell[0] - goal[0])
+        dy = abs(cell[1] - goal[1])
+        D = 1.0
+        D2 = 1.414
+        return D * (dx + dy) + (D2 - 2 * D) * min(dx, dy)
     
-    def find_waypoint_path(self, bot_id, start_x, start_y, goal_x, goal_y):
-        """Find the best waypoint path from start to goal avoiding drop zones"""
+    def get_neighbors(self, cell):
+        """Get valid neighbors (8-connected with diagonals)"""
+        x, y = cell
+        neighbors = [
+            (x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1),  # Orthogonal
+            (x + 1, y + 1), (x + 1, y - 1), (x - 1, y + 1), (x - 1, y - 1)  # Diagonal
+        ]
         
-        # Find nearest waypoint to start position
-        min_dist_start = float('inf')
-        start_wp_idx = 0
-        for i, wp in enumerate(self.docking_waypoints):
-            if not self.is_point_in_drop_zone(wp[0], wp[1]):
-                dist = self.distance(start_x, start_y, wp[0], wp[1])
-                if dist < min_dist_start:
-                    min_dist_start = dist
-                    start_wp_idx = i
+        valid_neighbors = []
+        for nx, ny in neighbors:
+            if 0 <= nx < self.grid_size and 0 <= ny < self.grid_size:
+                if self.grid[nx][ny] == 0:  # Not obstacle
+                    valid_neighbors.append((nx, ny))
         
-        # Find nearest waypoint to goal position
-        min_dist_goal = float('inf')
-        goal_wp_idx = 0
-        for i, wp in enumerate(self.docking_waypoints):
-            if not self.is_point_in_drop_zone(wp[0], wp[1]):
-                dist = self.distance(goal_x, goal_y, wp[0], wp[1])
-                if dist < min_dist_goal:
-                    min_dist_goal = dist
-                    goal_wp_idx = i
+        return valid_neighbors
+    
+    def astar(self, start_x, start_y, goal_x, goal_y):
+        """A* pathfinding - returns list of (world_x, world_y) waypoints"""
+        start = self.world_to_grid(start_x, start_y)
+        goal = self.world_to_grid(goal_x, goal_y)
         
-        # Create path along waypoints (going in the shorter direction around the loop)
-        path = []
-        num_waypoints = len(self.docking_waypoints)
+        # Check if start/goal valid
+        if self.grid[start[0]][start[1]] == 1 or self.grid[goal[0]][goal[1]] == 1:
+            print(f"A* failed: start {start} or goal {goal} is obstacle")
+            return []
         
-        # Calculate distance going clockwise vs counter-clockwise
-        if start_wp_idx <= goal_wp_idx:
-            clockwise_dist = goal_wp_idx - start_wp_idx
-            counter_clockwise_dist = num_waypoints - clockwise_dist
+        counter = 0
+        open_set = []
+        heapq.heappush(open_set, (0, counter, start))
+        
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: self.heuristic(start, goal)}
+        closed_set = set()
+        
+        while open_set:
+            current_f, _, current = heapq.heappop(open_set)
+            
+            if current == goal:
+                # Reconstruct path
+                grid_path = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    grid_path.append(current)
+                grid_path.reverse()
+                
+                # Convert to world coordinates
+                world_path = []
+                for gx, gy in grid_path:
+                    wx, wy = self.grid_to_world(gx, gy)
+                    world_path.append((wx, wy))
+                
+                return world_path
+            
+            closed_set.add(current)
+            
+            for neighbor in self.get_neighbors(current):
+                if neighbor in closed_set:
+                    continue
+                
+                # Calculate cost (diagonal = 1.414, orthogonal = 1.0)
+                dx = abs(neighbor[0] - current[0])
+                dy = abs(neighbor[1] - current[1])
+                move_cost = 1.414 if (dx == 1 and dy == 1) else 1.0
+                
+                tentative_g = g_score[current] + move_cost
+                
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score[neighbor] = tentative_g + self.heuristic(neighbor, goal)
+                    
+                    counter += 1
+                    heapq.heappush(open_set, (f_score[neighbor], counter, neighbor))
+        
+        return []  # No path found
+    
+    def navigate_waypoints(self, bot_id, final_theta=None):
+        """
+        Navigate through waypoints for a bot
+        Returns: (reached_final, target_x, target_y, target_theta)
+        """
+        # If no waypoints or finished
+        if not self.bot_waypoints[bot_id] or \
+           self.bot_current_waypoint_index[bot_id] >= len(self.bot_waypoints[bot_id]):
+            return True, self.bot_pose[bot_id][0], self.bot_pose[bot_id][1], final_theta or 0.0
+        
+        # Get current target waypoint
+        target_x, target_y = self.bot_waypoints[bot_id][self.bot_current_waypoint_index[bot_id]]
+        
+        # Distance to current waypoint
+        dist = math.sqrt((target_x - self.bot_pose[bot_id][0])**2 + 
+                        (target_y - self.bot_pose[bot_id][1])**2)
+        
+        # If reached waypoint, move to next
+        if dist < self.waypoint_reached_threshold:
+            self.bot_current_waypoint_index[bot_id] += 1
+            print(f"Bot {bot_id}: Reached waypoint {self.bot_current_waypoint_index[bot_id]}/{len(self.bot_waypoints[bot_id])}")
+            
+            # Check if finished all waypoints
+            if self.bot_current_waypoint_index[bot_id] >= len(self.bot_waypoints[bot_id]):
+                return True, target_x, target_y, final_theta or 0.0
+            
+            # Get next waypoint
+            target_x, target_y = self.bot_waypoints[bot_id][self.bot_current_waypoint_index[bot_id]]
+        
+        # Calculate target theta (direction toward waypoint)
+        error_x = target_x - self.bot_pose[bot_id][0]
+        error_y = target_y - self.bot_pose[bot_id][1]
+        
+        # Use final_theta only at last waypoint
+        is_last_waypoint = (self.bot_current_waypoint_index[bot_id] == len(self.bot_waypoints[bot_id]) - 1)
+        if is_last_waypoint and final_theta is not None:
+            target_theta = final_theta
         else:
-            counter_clockwise_dist = start_wp_idx - goal_wp_idx
-            clockwise_dist = num_waypoints - counter_clockwise_dist
+            target_theta = math.atan2(error_y, error_x) - (math.pi/2)
         
-        # Choose shorter path
-        if clockwise_dist <= counter_clockwise_dist:
-            # Go clockwise
-            idx = start_wp_idx
-            while idx != goal_wp_idx:
-                if not self.is_point_in_drop_zone(self.docking_waypoints[idx][0], 
-                                                   self.docking_waypoints[idx][1]):
-                    path.append(self.docking_waypoints[idx])
-                idx = (idx + 1) % num_waypoints
-        else:
-            # Go counter-clockwise
-            idx = start_wp_idx
-            while idx != goal_wp_idx:
-                if not self.is_point_in_drop_zone(self.docking_waypoints[idx][0], 
-                                                   self.docking_waypoints[idx][1]):
-                    path.append(self.docking_waypoints[idx])
-                idx = (idx - 1) % num_waypoints
+        return False, target_x, target_y, target_theta
         
-        # Add final waypoint if it's safe
-        if not self.is_point_in_drop_zone(self.docking_waypoints[goal_wp_idx][0], 
-                                           self.docking_waypoints[goal_wp_idx][1]):
-            path.append(self.docking_waypoints[goal_wp_idx])
-        
-        return path
+    # ============ ORIGINAL METHODS ============
         
     def check_crate_in_zone(self, crate_id):
-        
         if crate_id not in self.crates:
             return False
         
@@ -255,7 +328,6 @@ class MultiHolonomicController(Node):
             return False  
                 
     def assign_crates(self):
-        
         currently_assigned = [cid for cid in self.bot_assigned_crate if cid is not None]
           
         unassigned_crates = [
@@ -294,23 +366,26 @@ class MultiHolonomicController(Node):
             self.d_zone_bot[drop_zone_id] = bot_id
             self.STATE[bot_id] = "GO_TO_CRATE"
             
-            print(f"Assigned Crate {crate_id} to Bot {bot_id}")
+            # COMPUTE PATH TO CRATE
+            crate_x, crate_y = self.crates[crate_id][0], self.crates[crate_id][1]
+            bot_x, bot_y = self.bot_pose[bot_id][0], self.bot_pose[bot_id][1]
+            waypoints = self.astar(bot_x, bot_y, crate_x, crate_y)
+            
+            if waypoints:
+                self.bot_waypoints[bot_id] = waypoints
+                self.bot_current_waypoint_index[bot_id] = 0
+                print(f"Assigned Crate {crate_id} to Bot {bot_id}, path: {len(waypoints)} waypoints")
+            else:
+                print(f"WARNING: No path to crate {crate_id} for bot {bot_id}")
 
     def pose_cb(self, msg):
         for pose in msg.poses:
                 bot_id = int(pose.id/2)
                 self.bot_pose[bot_id] = [pose.x,pose.y,pose.w]
-                # print(f"{bot_id}------------------------{self.bot_pose[bot_id]}")
                 
     def crate_cb(self, msg):
         for pose in msg.poses:
-            # if pose.id in [12,14,30]:
                 self.crates[pose.id] = [pose.x,pose.y,pose.w]
-        # print(self.current_crates)
-        
-    def ir_callback(self,msg):
-        bot_id = int(msg.id/2)
-        self.ir_state[bot_id] = msg.state
                 
     def pid_reset(self, bot_id):
         self.pid_controllers[bot_id]['x'].reset()
@@ -318,10 +393,7 @@ class MultiHolonomicController(Node):
         self.pid_controllers[bot_id]['theta'].reset()
         
     def control_cb(self):
-
-        # print("Control CB Triggered")
         if any(pose[0] is None for pose in self.bot_pose):
-            # print("Waiting for all bot poses...")
             return
     
         now = self.get_clock().now()
@@ -333,12 +405,10 @@ class MultiHolonomicController(Node):
         self.assign_crates()
         
         for bot_id in [0,1,2]:
-            
             state = self.STATE[bot_id]
               
             if state == "IDLE":
-                print(f"Bot {bot_id} in IDLE")
-                wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]
+                wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.base[bot_id], self.elbow[bot_id]]
                 self.publish_wheel_velocities(wheel_vel)
               
             elif state == "GO_TO_CRATE":
@@ -348,23 +418,27 @@ class MultiHolonomicController(Node):
                     self.STATE[bot_id] = "IDLE"
                     continue
                 
-                target_x, target_y, crate_theta = self.crates[crate_id]
-  
-                error_x = target_x - self.bot_pose[bot_id][0]
-                error_y = target_y - self.bot_pose[bot_id][1]
-                target_theta = math.atan2(error_y, error_x) - (math.pi/2)
-                dist,theta = self.go_to_target(bot_id,target_x,target_y,target_theta,error_threshold = 145,angle_threshold = 0.1,use_target_theta = True)
+                # Navigate using waypoints
+                crate_x, crate_y, crate_theta = self.crates[crate_id]
+                error_x = crate_x - self.bot_pose[bot_id][0]
+                error_y = crate_y - self.bot_pose[bot_id][1]
+                final_theta = math.atan2(error_y, error_x) - (math.pi/2)
                 
-                if dist<145 and abs(theta)<0.1:
-                    # if self.ir_state[bot_id]:
-                       self.STATE[bot_id] = "PICK_UP"
-                       self.pid_reset(bot_id)
-                    # else:
-                    #     wheel_vel = [bot_id, -50.0, 50.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]
-                    #     self.publish_wheel_velocities(wheel_vel)
-                    #     # print(f"Bot {bot_id} WAITING for IR Sensor")
-                    #     print(f"retreating {bot_id}")
-                                              
+                reached, target_x, target_y, target_theta = self.navigate_waypoints(bot_id, final_theta)
+                
+                if not reached:
+                    # Still navigating waypoints
+                    dist, theta = self.go_to_target(bot_id, target_x, target_y, target_theta,
+                                                   error_threshold=60, angle_threshold=0.2, use_target_theta=True)
+                else:
+                    # Reached final waypoint, do precise positioning
+                    dist, theta = self.go_to_target(bot_id, crate_x, crate_y, final_theta,
+                                                   error_threshold=145, angle_threshold=0.1, use_target_theta=True)
+                    
+                    if dist < 145.0 and abs(theta) < 0.1:
+                        self.STATE[bot_id] = "PICK_UP"
+                        self.pid_reset(bot_id)
+                    
             elif state == "PICK_UP":
                 print(f"Bot {bot_id} PICK_UP")
                 if not self.crate_reached[bot_id]:
@@ -375,34 +449,58 @@ class MultiHolonomicController(Node):
                          self.pick_crate(bot_id)
                 
                 if self.attach_success[bot_id]:
+                    # COMPUTE PATH TO DROP ZONE
+                    crate_id = self.bot_assigned_crate[bot_id]
+                    drop_zone_id = crate_id % 3
+                    zone = self.d_zone[drop_zone_id]
+                    target_x = (zone[0] + zone[1]) / 2
+                    target_y = (zone[2] + zone[3]) / 2
+                    
+                    bot_x, bot_y = self.bot_pose[bot_id][0], self.bot_pose[bot_id][1]
+                    waypoints = self.astar(bot_x, bot_y, target_x, target_y)
+                    
+                    if waypoints:
+                        self.bot_waypoints[bot_id] = waypoints
+                        self.bot_current_waypoint_index[bot_id] = 0
+                        print(f"Bot {bot_id}: Path to drop zone, {len(waypoints)} waypoints")
+                    
                     self.STATE[bot_id] = "GO_TO_DROP_ZONE"
                     self.pid_reset(bot_id)
                
             elif state == "GO_TO_DROP_ZONE":
                 crate_id = self.bot_assigned_crate[bot_id]
-                drop_zone_id = crate_id % 3  # 0=red, 1=green, 2=blue
+                drop_zone_id = crate_id % 3
                 
                 zone = self.d_zone[drop_zone_id]
                 target_x = (zone[0] + zone[1]) / 2
                 target_y = (zone[2] + zone[3]) / 2
                 error_x = target_x - self.bot_pose[bot_id][0]
                 error_y = target_y - self.bot_pose[bot_id][1]
-                target_theta = math.atan2(error_y, error_x) - (math.pi/2) 
+                final_theta = math.atan2(error_y, error_x) - (math.pi/2)
                 
                 if self.d_zone_assigned[drop_zone_id] and self.d_zone_bot[drop_zone_id] != bot_id:
                     print(f"Bot {bot_id} WAITING - Zone {drop_zone_id} taken by {self.d_zone_bot[drop_zone_id]}")
-                    wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]
+                    wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.base[bot_id], self.elbow[bot_id]]
                     self.publish_wheel_velocities(wheel_vel)
                     continue
                 else:
                     print(f"Bot {bot_id} GO_TO_DROP_ZONE {drop_zone_id}")
                 
-                dist, theta = self.go_to_target(bot_id, target_x, target_y, target_theta, 
-                                             error_threshold=160, angle_threshold=0.6, use_target_theta=True)
-
-                if dist < 160 and abs(theta)<0.6:
-                    self.STATE[bot_id] = "DROP"
-                    self.pid_reset(bot_id)
+                # Navigate using waypoints
+                reached, wp_target_x, wp_target_y, wp_target_theta = self.navigate_waypoints(bot_id, final_theta)
+                
+                if not reached:
+                    # Still following waypoints
+                    dist, theta = self.go_to_target(bot_id, wp_target_x, wp_target_y, wp_target_theta,
+                                                   error_threshold=60, angle_threshold=0.3, use_target_theta=True)
+                else:
+                    # Final approach to drop zone center
+                    dist, theta = self.go_to_target(bot_id, target_x, target_y, final_theta,
+                                                   error_threshold=160, angle_threshold=0.6, use_target_theta=True)
+                    
+                    if dist < 160 and abs(theta) < 0.6:
+                        self.STATE[bot_id] = "DROP"
+                        self.pid_reset(bot_id)
                    
             elif state == "DROP":
                 print(f"Bot {bot_id} DROP")
@@ -420,35 +518,34 @@ class MultiHolonomicController(Node):
                         if self.check_crate_in_zone(crate_id):
                             print(f"Bot {bot_id}: Crate {crate_id} placed correctly")
                             self.completed_crates.add(crate_id)
-                            print("crate raw pose:", crate_id, self.crates[crate_id])
-                            print("zone bounds:", self.d_zone[crate_id%3])
                         else:
                             print(f"Bot {bot_id}: Crate {crate_id} NOT in zone")
-                            print("crate raw pose:", crate_id, self.crates[crate_id])
-                            print("zone bounds:", self.d_zone[crate_id%3])
                     
                         self.bot_assigned_crate[bot_id] = None
                         self.crate_reached[bot_id] = False
                         self.attach_success[bot_id] = False
                         self.detach_success[bot_id] = False
                         self.in_drop_zone[bot_id] = False
+                        self.drop_wait_count[bot_id] = 0
                         
                         currently_assigned = sum(1 for cid in self.bot_assigned_crate if cid is not None)
                         total_handled = len(self.completed_crates) + currently_assigned
                         all_crates_known = len(self.crates)
                         
                         if total_handled >= all_crates_known and all_crates_known > 0:
-                            self.STATE[bot_id] = "GO_TO_DOCKING_ZONE"
-                            # Calculate waypoint path when transitioning to docking
+                            # COMPUTE PATH TO DOCKING ZONE
                             dock = self.docking_zone[bot_id]
                             bot_x, bot_y = self.bot_pose[bot_id][0], self.bot_pose[bot_id][1]
-                            self.waypoint_path[bot_id] = self.find_waypoint_path(bot_id, bot_x, bot_y, dock[0], dock[1])
-                            self.current_waypoint_index[bot_id] = 0
-                            print(f"Bot {bot_id} waypoint path: {len(self.waypoint_path[bot_id])} waypoints")
+                            waypoints = self.astar(bot_x, bot_y, dock[0], dock[1])
+                            
+                            if waypoints:
+                                self.bot_waypoints[bot_id] = waypoints
+                                self.bot_current_waypoint_index[bot_id] = 0
+                                print(f"Bot {bot_id}: Path to docking, {len(waypoints)} waypoints")
+                            
+                            self.STATE[bot_id] = "GO_TO_DOCKING_ZONE"
                         else:
                             self.STATE[bot_id] = "IDLE"
-                        
-                        print(f"Handled: {total_handled}/{all_crates_known} → Dock: {total_handled >= all_crates_known}")
                         
                         drop_zone_id = crate_id % 3
                         self.d_zone_assigned[drop_zone_id] = False
@@ -459,101 +556,87 @@ class MultiHolonomicController(Node):
                 print(f"Bot {bot_id} GO_TO_DOCKING_ZONE")
                 dock = self.docking_zone[bot_id]
                 
-                # If waypoint path exists and not completed
-                if self.waypoint_path[bot_id] and self.current_waypoint_index[bot_id] < len(self.waypoint_path[bot_id]):
-                    # Navigate through waypoints
-                    current_wp = self.waypoint_path[bot_id][self.current_waypoint_index[bot_id]]
-                    wp_x, wp_y = current_wp[0], current_wp[1]
-                    
-                    # Calculate target theta towards waypoint
-                    error_x = wp_x - self.bot_pose[bot_id][0]
-                    error_y = wp_y - self.bot_pose[bot_id][1]
-                    target_theta = math.atan2(error_y, error_x) - (math.pi/2)
-                    
-                    dist, theta_error = self.go_to_target(bot_id, wp_x, wp_y, target_theta,
-                                                           error_threshold=60, angle_threshold=0.3, use_target_theta=False)
-                    
-                    # Move to next waypoint when current one is reached
-                    if dist < 60:
-                        self.current_waypoint_index[bot_id] += 1
-                        print(f"Bot {bot_id} reached waypoint {self.current_waypoint_index[bot_id]}/{len(self.waypoint_path[bot_id])}")
-                        self.pid_reset(bot_id)
+                # Navigate using waypoints
+                reached, wp_target_x, wp_target_y, wp_target_theta = self.navigate_waypoints(bot_id, dock[2])
+                
+                if not reached:
+                    # Following waypoints
+                    dist, theta_error = self.go_to_target(bot_id, wp_target_x, wp_target_y, wp_target_theta,
+                                                         error_threshold=60, angle_threshold=0.2, use_target_theta=True)
                 else:
-                    # All waypoints completed or no waypoints, go directly to dock
+                    # Final docking precision
                     dist, theta_error = self.go_to_target(bot_id, dock[0], dock[1], dock[2],
-                                                           error_threshold=50, angle_threshold=0.25, use_target_theta=True)
+                                                         error_threshold=20, angle_threshold=0.15, use_target_theta=True)
                     
-                    if dist < 50 and abs(theta_error) < 0.25:
+                    if dist < 20 and abs(theta_error) < 0.1:
                         self.in_docking_zone[bot_id] = True
                         self.STATE[bot_id] = "COMPLETE"
-                        wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]
+                        wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.base[bot_id], self.elbow[bot_id]]
                         self.publish_wheel_velocities(wheel_vel)
                         print(f"Bot {bot_id} DOCKED!")
    
-    
-    def go_to_target(self, bot_id , target_x, target_y, target_theta, error_threshold, angle_threshold, use_target_theta):
-    
-       error_x = target_x - self.bot_pose[bot_id][0]
-       error_y = target_y - self.bot_pose[bot_id][1]
-       theta_robot = np.radians(self.bot_pose[bot_id][2])
-       error_theta = theta_robot - target_theta
-       error_theta = math.atan2(math.sin(error_theta), math.cos(error_theta))
-       
-       dist = math.sqrt(error_x**2 + error_y**2)
-       
-       if dist > error_threshold:
-           
-           vx_global = self.pid_controllers[bot_id]['x'].compute(error_x, self.dt)
-           vy_global = self.pid_controllers[bot_id]['y'].compute(error_y, self.dt)
-           
-           vx = vx_global * math.cos(theta_robot) + vy_global * math.sin(theta_robot)
-           vy = -vx_global * math.sin(theta_robot) + vy_global * math.cos(theta_robot)
-           vtheta = 0.0
-           if dist < (error_threshold+50):
-               vx = vx*0.4
-               vy = vy*0.4
-           
-       elif abs(error_theta) > angle_threshold and use_target_theta: 
-           vx = vy = 0.0
-           pid_output = self.pid_controllers[bot_id]['theta'].compute(error_theta, self.dt)
-           if pid_output >= 0:
-               vtheta = max(pid_output, 25.0)
-           else:
-               vtheta = -max(abs(pid_output), 25.0)
-           
-       else:
-           vx = 0.0
-           vy = 0.0
-           vtheta = 0.0
-       
+    def go_to_target(self, bot_id, target_x, target_y, target_theta, error_threshold, angle_threshold, use_target_theta):
+        error_x = target_x - self.bot_pose[bot_id][0]
+        error_y = target_y - self.bot_pose[bot_id][1]
+        theta_robot = np.radians(self.bot_pose[bot_id][2])
+        error_theta = theta_robot - target_theta
+        error_theta = math.atan2(math.sin(error_theta), math.cos(error_theta))
+        
+        dist = math.sqrt(error_x**2 + error_y**2)
+        
+        if dist > error_threshold:
+            
+            vx_global = self.pid_controllers[bot_id]['x'].compute(error_x, self.dt)
+            vy_global = self.pid_controllers[bot_id]['y'].compute(error_y, self.dt)
+            
+            vx = vx_global * math.cos(theta_robot) + vy_global * math.sin(theta_robot)
+            vy = -vx_global * math.sin(theta_robot) + vy_global * math.cos(theta_robot)
+            vtheta = 0.0
+            if dist < (error_threshold+50):
+                vx = vx*0.4
+                vy = vy*0.4
+            
+        elif abs(error_theta) > angle_threshold and use_target_theta: 
+            vx = vy = 0.0
+            pid_output = self.pid_controllers[bot_id]['theta'].compute(error_theta, self.dt)
+            if pid_output >= 0:
+                vtheta = max(pid_output, 25.0)
+            else:
+                vtheta = -max(abs(pid_output), 25.0)
+            
+        else:
+            vx = 0.0
+            vy = 0.0
+            vtheta = 0.0
+        
     #    self.get_logger().info(f"dist -- {dist}")
     #    self.get_logger().info(f"error_x ={error_x}, error_y ={error_y}")
     #    self.get_logger().info(f"targetx ={target_x}, targety ={target_y}")
     #    self.get_logger().info(f"target={target_theta:.2f}, robot={theta_robot:.2f}, error={error_theta:.2f}")
     #    self.get_logger().info(f"botid - {bot_id} vx - {vx}   vy - {vy}   vtheta - {vtheta}")
-             
-       alpha_deg = np.array([30, 150, 270])
-       alpha_rad = np.radians(alpha_deg)
-   
-       M = np.array([[np.cos(alpha_rad[0] + np.pi/2), np.cos(alpha_rad[1] + np.pi/2), np.cos(alpha_rad[2] + np.pi/2)],
-                     [np.sin(alpha_rad[0] + np.pi/2), np.sin(alpha_rad[1] + np.pi/2), np.sin(alpha_rad[2] + np.pi/2)],
-                     [1, 1, 1]])
-       M_inv = np.linalg.inv(M)
-       
-       vel = np.array([[vx], [vy], [vtheta]])
-       s = np.dot(M_inv, vel)
-       
-       wheel_vel = [bot_id, s[0][0], s[1][0], s[2][0], self.arm[bot_id], self.solenoid[bot_id]]
-       self.publish_wheel_velocities(wheel_vel)
-       
-       return dist, error_theta
-   
+              
+        alpha_deg = np.array([30, 150, 270])
+        alpha_rad = np.radians(alpha_deg)
+    
+        M = np.array([[np.cos(alpha_rad[0] + np.pi/2), np.cos(alpha_rad[1] + np.pi/2), np.cos(alpha_rad[2] + np.pi/2)],
+                      [np.sin(alpha_rad[0] + np.pi/2), np.sin(alpha_rad[1] + np.pi/2), np.sin(alpha_rad[2] + np.pi/2)],
+                      [1, 1, 1]])
+        M_inv = np.linalg.inv(M)
+        
+        vel = np.array([[vx], [vy], [vtheta]])
+        s = np.dot(M_inv, vel)
+        
+        wheel_vel = [bot_id, s[0][0], s[1][0], s[2][0], self.base[bot_id], self.elbow[bot_id]]
+        self.publish_wheel_velocities(wheel_vel)
+        
+        return dist, error_theta
+    
     def pick_crate(self,bot_id):      
         if self.pick_start_time[bot_id] is None:
             self.pick_start_time[bot_id] = time.time()
-            self.arm[bot_id] = 90.0    
-            self.solenoid[bot_id] = 90.0  
-            wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]] 
+            self.base[bot_id] = 90.0    
+            self.elbow[bot_id] = 90.0  
+            wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.base[bot_id], self.elbow[bot_id]] 
             self.publish_wheel_velocities(wheel_vel)
             return
         elapsed = time.time() - self.pick_start_time[bot_id]
@@ -567,9 +650,9 @@ class MultiHolonomicController(Node):
     def place_crate(self,bot_id):  
         if self.drop_start_time[bot_id] is None:
             self.drop_start_time[bot_id] = time.time()    
-            self.arm[bot_id] = 90.0    
-            self.solenoid[bot_id] = 90.0        
-            wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]  
+            self.base[bot_id] = 90.0    
+            self.elbow[bot_id] = 90.0        
+            wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.base[bot_id], self.elbow[bot_id]]  
             self.publish_wheel_velocities(wheel_vel)
             return
         elapsed = time.time() - self.drop_start_time[bot_id]
@@ -624,9 +707,9 @@ class MultiHolonomicController(Node):
             self.attach_success[bot_id] = response.success
             if self.attach_success[bot_id]:
                 print(f"Bot {bot_id} attached crate successfully")   
-                self.arm[bot_id] = 70.0    
-                self.solenoid[bot_id] = 70.0               
-                wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]  
+                self.base[bot_id] = 70.0    
+                self.elbow[bot_id] = 70.0               
+                wheel_vel = [bot_id, 0.0, 0.0, 0.0, self.base[bot_id], self.elbow[bot_id]]  
                 self.publish_wheel_velocities(wheel_vel)
             else:
                 print(f"Bot {bot_id} attach failed, retrying...")
@@ -640,9 +723,9 @@ class MultiHolonomicController(Node):
             self.detach_success[bot_id] = response.success
             if self.detach_success[bot_id]:
                 print(f"Bot {bot_id} detached crate successfully")  
-                self.arm[bot_id] = 5.0    
-                self.solenoid[bot_id] = 5.0                     
-                wheel_vel = [bot_id, -50.0, 50.0, 0.0, self.arm[bot_id], self.solenoid[bot_id]]  
+                self.base[bot_id] = 5.0    
+                self.elbow[bot_id] = 5.0                     
+                wheel_vel = [bot_id, -50.0, 50.0, 0.0, self.base[bot_id], self.elbow[bot_id]]  
                 self.publish_wheel_velocities(wheel_vel)
             else:
                 print(f"Bot {bot_id} detach failed, retrying...")
@@ -652,7 +735,7 @@ class MultiHolonomicController(Node):
         
 def main(args=None):
     rclpy.init(args=args)
-    controller = MultiHolonomicController()
+    controller = HolonomicPIDController()
     rclpy.spin(controller)
     controller.destroy_node()
     rclpy.shutdown()

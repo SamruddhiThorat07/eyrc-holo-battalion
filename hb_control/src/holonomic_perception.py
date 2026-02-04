@@ -91,7 +91,7 @@ class PoseDetector(Node):
         offset_x = world_x - center_x
         offset_y = world_y - center_y
         
-        scale_factor = 1.0142
+        scale_factor = 1.04
         corrected_offset_x = offset_x / scale_factor
         corrected_offset_y = offset_y / scale_factor
         
