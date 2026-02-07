@@ -42,6 +42,7 @@ install(
   PROGRAMS src/task_1c.py
   PROGRAMS src/perception.py
   PROGRAMS src/holonomic_controller_hardware.py
+  PROGRAMS src/task_5b.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
